@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>iPhone Cam to OBS</title>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body, html { width: 100%; height: 100%; background: #000; color: #fff; overflow: hidden; }
+
+    /* OBS / Alıcı Modu (Sadece video, sıfır buton/kenarlık) */
+    .obs-view { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; background: #000; }
+    #remoteVideo { width: 100%; height: 100%; object-fit: cover; }
+
+    /* iPhone & Menü Paneli */
+    .container { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; padding: 20px; text-align: center; }
+    .card { background: rgba(20, 20, 20, 0.85); backdrop-filter: blur(15px); border: 1px solid rgba(255,255,255,0.1); padding: 24px; border-radius: 20px; max-width: 420px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.8); }
+    
+    h1 { font-size: 1.4rem; margin-bottom: 8px; font-weight: 700; color: #00f2fe; }
+    p { font-size: 0.9rem; color: #aaa; margin-bottom: 20px; }
+
+    .code-box { background: #111; border: 2px dashed #00f2fe; border-radius: 12px; padding: 16px; font-size: 2.2rem; font-weight: 900; letter-spacing: 6px; color: #4facfe; margin-bottom: 15px; user-select: all; }
+    .input-box { width: 100%; padding: 14px; border-radius: 10px; border: 1px solid #333; background: #151515; color: #fff; font-size: 1.1rem; text-align: center; margin-bottom: 12px; outline: none; text-transform: uppercase; letter-spacing: 2px; }
+    
+    .btn { width: 100%; padding: 14px; border-radius: 10px; border: none; font-size: 1rem; font-weight: 600; cursor: pointer; transition: 0.2s; margin-bottom: 8px; }
+    .btn-primary { background: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%); color: #000; }
+    .btn-secondary { background: #222; color: #fff; border: 1px solid #444; }
+    .btn:active { transform: scale(0.98); }
+
+    /* iPhone Önizleme */
+    #localVideo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; opacity: 0.5; }
+    .iphone-controls { position: absolute; bottom: 30px; z-index: 20; display: flex; gap: 10px; }
+    .iphone-controls button { background: rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.2); color: #fff; padding: 10px 16px; border-radius: 30px; backdrop-filter: blur(10px); }
+  </style>
+</head>
+<body>
+
+  <!-- Alıcı / OBS Ekranı -->
+  <div id="receiverContainer" class="obs-view" style="display: none;">
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+
+  <!-- Ana Seçim / Giriş Ekranı -->
+  <div class="container" id="menuContainer">
+    <div class="card" id="mainCard">
+      <h1>iPhone Web Kamera</h1>
+      <p>Bu cihazı kamera olarak mı yoksa OBS/PC ekranı olarak mı kullanacaksın?</p>
+      <button class="btn btn-primary" onclick="startBroadcaster()">📱 iPhone Olarak Başlat</button>
+      <div style="margin: 15px 0; color: #555;">veya</div>
+      <input type="text" id="joinCodeInput" class="input-box" placeholder="6 HANELİ KODU GİR">
+      <button class="btn btn-secondary" onclick="startReceiver(document.getElementById('joinCodeInput').value)">🖥️ PC / OBS Olarak Bağlan</button>
+    </div>
+
+    <!-- iPhone Yayın Ekranı -->
+    <div class="card" id="senderCard" style="display: none;">
+      <h1>YAYIN HAZIR!</h1>
+      <p>PC'den siteye girip bu kodu yaz veya OBS'e direkt linki yapıştır:</p>
+      <div class="code-box" id="displayCode">------</div>
+      <p id="obsLink" style="font-size: 0.75rem; word-break: break-all; color: #00f2fe; margin-bottom: 15px;"></p>
+      <button class="btn btn-secondary" onclick="switchCamera()">🔄 Kamerayı Değiştir (Ön/Arka)</button>
+    </div>
+  </div>
+
+  <video id="localVideo" autoplay playsinline muted style="display: none;"></video>
+
+  <script>
+    let localStream = null;
+    let peer = null;
+    let currentFacingMode = "environment"; // iPhone arka kamera önceliği
+
+    // URL Parametresi Kontrolü (Doğrudan OBS Linki İçin: ?code=123456)
+    window.addEventListener('DOMContentLoaded', () => {
+      const urlParams = new URLSearchParams(window.location.search);
+      const code = urlParams.get('code');
+      if (code) {
+        startReceiver(code);
+      }
+    });
+
+    // 1. IPHONE (YAYINCI) TARAFI
+    async function startBroadcaster() {
+      document.getElementById('mainCard').style.display = 'none';
+      document.getElementById('senderCard').style.display = 'block';
+      document.getElementById('localVideo').style.display = 'block';
+
+      // Ekran kapanmasını engelle (WakeLock)
+      if ('wakeLock' in navigator) {
+        try { await navigator.wakeLock.request('screen'); } catch(e){}
+      }
+
+      await initCamera();
+
+      // Rastgele 6 haneli kod üret
+      const randomCode = Math.floor(100000 + Math.random() * 900000).toString();
+      document.getElementById('displayCode').innerText = randomCode;
+
+      // OBS için doğrudan link oluştur
+      const obsURL = `${window.location.origin}${window.location.pathname}?code=${randomCode}`;
+      document.getElementById('obsLink').innerText = "OBS Linki: " + obsURL;
+
+      // PeerJS başlat (ID çakışmasını önlemek için benzersiz prefix eklenir)
+      peer = new Peer('cam-stream-' + randomCode);
+
+      peer.on('call', (call) => {
+        // PC bağlandığında yayını gönder
+        call.answer(localStream);
+      });
+
+      peer.on('error', (err) => {
+        console.error("PeerJS Hatası:", err);
+      });
+    }
+
+    // iPhone En Yüksek Kalite Kamera Akışı
+    async function initCamera() {
+      if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+      }
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: currentFacingMode,
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 60, min: 30 }
+          },
+          audio: true // İstersen iPhone mikrofonunu da OBS'e iletir
+        });
+        document.getElementById('localVideo').srcObject = localStream;
+      } catch (err) {
+        alert("Kamera izni verilemedi veya HTTPS kullanılmıyor! Hata: " + err.message);
+      }
+    }
+
+    // Ön/Arka Kamera Değiştirici
+    async function switchCamera() {
+      currentFacingMode = (currentFacingMode === "environment") ? "user" : "environment";
+      await initCamera();
+    }
+
+    // 2. OBS / PC (ALICI) TARAFI
+    function startReceiver(targetCode) {
+      if (!targetCode) {
+        alert("Lütfen geçerli bir kod girin!");
+        return;
+      }
+      targetCode = targetCode.trim().toUpperCase();
+
+      // UI elemanlarını tamamen gizle (OBS'e tertemiz görüntü vermek için)
+      document.getElementById('menuContainer').style.display = 'none';
+      document.getElementById('localVideo').style.display = 'none';
+      document.getElementById('receiverContainer').style.display = 'flex';
+
+      const receiverPeer = new Peer();
+
+      receiverPeer.on('open', () => {
+        // Boş bir ses/video track ile iPhone'u çağır
+        navigator.mediaDevices.getUserMedia({ video: false, audio: false })
+          .catch(() => null)
+          .then(() => {
+            const call = receiverPeer.call('cam-stream-' + targetCode, createEmptyStream());
+            call.on('stream', (remoteStream) => {
+              const video = document.getElementById('remoteVideo');
+              video.srcObject = remoteStream;
+              video.play();
+            });
+          });
+      });
+
+      receiverPeer.on('error', (err) => {
+        alert("iPhone'a bağlanılamadı. Kodu doğru girdiğinizden emin olun!");
+        console.error(err);
+      });
+    }
+
+    // WebRTC handshake için boş canvas stream'i
+    function createEmptyStream() {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      const stream = canvas.captureStream(1);
+      return stream;
+    }
+  </script>
+</body>
+</html>
